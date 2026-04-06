@@ -1,0 +1,133 @@
+name: devx Security Scanners
+
+on:
+  pull_request:
+    branches: ["**"]
+  schedule:
+    - cron: "0 0 * * 1" # Every Monday 00:00 UTC
+  workflow_dispatch: # Allow manual trigger
+
+jobs:
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      security-events: write
+
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Required for TruffleHog git history and baseline-commit
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache Trivy DB
+        uses: actions/cache@v4
+        with:
+          path: /tmp/trivy-cache
+          key: trivy-db-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: trivy-db-${{ runner.os }}-
+
+      - name: Install Python dependencies
+        run: pip install pyyaml semgrep
+
+      - name: Install TruffleHog
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh \
+            | sh -s -- -b /usr/local/bin
+
+      - name: Install Trivy v0.69.3 (pinned + checksum verified)
+        run: |
+          TRIVY_VERSION="0.69.3"
+          ARCHIVE="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          EXPECTED="1816b632dfe529869c740c0913e36bd1629cb7688bd5634f4a858c1d57c88b75"
+          wget -q "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/${ARCHIVE}"
+          echo "${EXPECTED}  ${ARCHIVE}" | sha256sum -c
+          tar -xzf "${ARCHIVE}" trivy
+          sudo mv trivy /usr/local/bin/trivy
+
+      - name: Fetch run_audit.py from awesome-devx-llm
+        run: |
+          curl -sSfL \
+            "https://raw.githubusercontent.com/devx-commerce/awesome-devx-llm/main/plugins/profiler/skills/security-audit/run_audit.py" \
+            -o run_audit.py
+
+      - name: Run scan (PR mode - new findings only)
+        if: github.event_name == 'pull_request'
+        id: scan_pr
+        run: |
+          BASELINE=$(git merge-base HEAD origin/${{ github.base_ref }})
+          python3 run_audit.py . \
+            --baseline-commit "$BASELINE" \
+            --fail-on high \
+            --sarif \
+            --trivy-cache-dir /tmp/trivy-cache 2>&1 | tee scan-output.txt
+          echo "exit_code=${PIPESTATUS[0]}" >> $GITHUB_OUTPUT
+        continue-on-error: true
+
+      - name: Run scan (scheduled/manual - full history)
+        if: github.event_name != 'pull_request'
+        id: scan_scheduled
+        run: |
+          python3 run_audit.py . \
+            --scan-history \
+            --fail-on high \
+            --sarif \
+            --trivy-cache-dir /tmp/trivy-cache 2>&1 | tee scan-output.txt
+          echo "exit_code=${PIPESTATUS[0]}" >> $GITHUB_OUTPUT
+        continue-on-error: true
+
+      - name: Post findings as PR comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.existsSync('security-audit/README.md')
+              ? fs.readFileSync('security-audit/README.md', 'utf8')
+              : '_No findings._';
+            const body = [
+              '## devx Security Scan',
+              '',
+              '> Powered by [devx-security-scanner](https://github.com/kalpmodi-svg/devx-security-scanner)',
+              '',
+              report.slice(0, 65000),
+            ].join('\n');
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body,
+            });
+
+      - name: Upload SARIF to GitHub Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: security-audit/
+        continue-on-error: true
+
+      - name: Upload scan artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-scan-${{ github.run_id }}
+          path: |
+            security-audit/README.md
+            security-audit/runs/
+            scan-output.txt
+          retention-days: 90
+
+      - name: Fail if high/critical found
+        if: always()
+        run: |
+          if grep -q "CRITICAL\|HIGH" security-audit/README.md 2>/dev/null; then
+            echo "High or critical findings detected. Review the PR comment and Security tab."
+            exit 1
+          fi
