@@ -42,14 +42,6 @@ jobs:
           key: trivy-db-${{ runner.os }}-${{ github.run_id }}
           restore-keys: trivy-db-${{ runner.os }}-
 
-      - name: Install Python dependencies
-        run: pip install pyyaml semgrep
-
-      - name: Install TruffleHog
-        run: |
-          curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh \
-            | sh -s -- -b /usr/local/bin
-
       - name: Install Trivy v0.69.3 (pinned + checksum verified)
         run: |
           TRIVY_VERSION="0.69.3"
@@ -60,22 +52,125 @@ jobs:
           tar -xzf "${ARCHIVE}" trivy
           sudo mv trivy /usr/local/bin/trivy
 
-      - name: Fetch run_audit.py from awesome-devx-llm
+      - name: Install TruffleHog
         run: |
-          curl -sSfL \
-            "https://raw.githubusercontent.com/devx-commerce/awesome-devx-llm/main/plugins/profiler/skills/security-audit/run_audit.py" \
-            -o run_audit.py
+          curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh \
+            | sh -s -- -b /usr/local/bin
 
-      - name: Run full history scan
-        id: scan
+      - name: Install Semgrep
+        run: pip install semgrep
+
+      - name: Create output directory
+        run: mkdir -p security-audit
+
+      - name: Run Trivy (dependency CVE scan)
         run: |
-          python3 run_audit.py . \
-            --scan-history \
-            --fail-on high \
-            --sarif \
-            --trivy-cache-dir /tmp/trivy-cache 2>&1 | tee scan-output.txt
-          echo "exit_code=${PIPESTATUS[0]}" >> $GITHUB_OUTPUT
+          trivy fs . \
+            --format sarif \
+            --output security-audit/trivy.sarif \
+            --cache-dir /tmp/trivy-cache \
+            --exit-code 0
         continue-on-error: true
+
+      - name: Run TruffleHog (secrets - full git history)
+        run: |
+          trufflehog git file://. --json --no-update 2>/dev/null \
+            > security-audit/trufflehog.json || true
+
+      - name: Convert TruffleHog JSON to SARIF
+        run: |
+          python3 << 'EOF'
+          import json, glob
+
+          findings = []
+          try:
+              with open("security-audit/trufflehog.json") as f:
+                  for line in f:
+                      line = line.strip()
+                      if line:
+                          try:
+                              findings.append(json.loads(line))
+                          except json.JSONDecodeError:
+                              pass
+          except FileNotFoundError:
+              pass
+
+          rules = []
+          results = []
+          seen_rules = set()
+
+          for finding in findings:
+              detector = finding.get("DetectorName", "unknown")
+              if detector not in seen_rules:
+                  seen_rules.add(detector)
+                  rules.append({
+                      "id": detector,
+                      "name": detector,
+                      "shortDescription": {"text": f"Hardcoded {detector} credential detected"},
+                      "defaultConfiguration": {"level": "error"},
+                      "properties": {"tags": ["security", "secrets"], "severity": "CRITICAL"}
+                  })
+
+              meta = finding.get("SourceMetadata", {}).get("Data", {})
+              git_meta = meta.get("Git", {})
+              file_path = git_meta.get("file", "unknown")
+              line_num = git_meta.get("line", 1)
+              verified = finding.get("Verified", False)
+
+              results.append({
+                  "ruleId": detector,
+                  "level": "error",
+                  "message": {
+                      "text": f"{'Verified' if verified else 'Potential'} {detector} credential found in git history"
+                  },
+                  "locations": [{
+                      "physicalLocation": {
+                          "artifactLocation": {"uri": file_path, "uriBaseId": "%SRCROOT%"},
+                          "region": {"startLine": max(1, int(line_num))}
+                      }
+                  }],
+                  "properties": {"severity": "CRITICAL" if verified else "HIGH"}
+              })
+
+          sarif = {
+              "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+              "version": "2.1.0",
+              "runs": [{
+                  "tool": {
+                      "driver": {
+                          "name": "TruffleHog",
+                          "version": "3.x",
+                          "informationUri": "https://github.com/trufflesecurity/trufflehog",
+                          "rules": rules
+                      }
+                  },
+                  "results": results
+              }]
+          }
+
+          with open("security-audit/trufflehog.sarif", "w") as f:
+              json.dump(sarif, f, indent=2)
+
+          print(f"Converted {len(results)} TruffleHog findings to SARIF")
+          EOF
+
+      - name: Run Semgrep (SAST scan)
+        run: |
+          semgrep scan \
+            --config auto \
+            --sarif \
+            --output security-audit/semgrep.sarif \
+            . 2>/dev/null || true
+        continue-on-error: true
+
+      - name: Debug - list SARIF files
+        if: always()
+        run: |
+          echo "=== SARIF files in security-audit/ ==="
+          ls -la security-audit/ 2>/dev/null || echo "Directory does not exist"
+          for f in security-audit/*.sarif; do
+            [ -f "$f" ] && echo "  $f: $(wc -c < "$f") bytes" || true
+          done
 
       - name: Upload SARIF to GitHub Security tab
         if: always()
@@ -89,16 +184,30 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: security-scan-${{ github.run_id }}
-          path: |
-            security-audit/README.md
-            security-audit/runs/
-            scan-output.txt
+          path: security-audit/
           retention-days: 90
 
-      - name: Fail if high/critical found
+      - name: Fail if high or critical findings detected
         if: always()
         run: |
-          if grep -q "CRITICAL\|HIGH" security-audit/README.md 2>/dev/null; then
-            echo "High or critical findings detected. Review the Security tab and scan artifacts."
-            exit 1
-          fi
+          python3 << 'EOF'
+          import json, glob, sys
+
+          found = False
+          for path in glob.glob("security-audit/*.sarif"):
+              try:
+                  data = json.load(open(path))
+              except Exception:
+                  continue
+              for run in data.get("runs", []):
+                  for result in run.get("results", []):
+                      if result.get("level") == "error":
+                          found = True
+                          break
+
+          if found:
+              print("HIGH or CRITICAL findings detected. Review the Security tab and scan artifacts.")
+              sys.exit(1)
+          else:
+              print("No HIGH or CRITICAL findings.")
+          EOF
